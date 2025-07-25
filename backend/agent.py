@@ -6,18 +6,16 @@ from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_core.tools import tool
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 import os
+import hashlib
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import pandas as pd
 import numpy as np
 import uuid
-from io import StringIO, BytesIO
+from io import StringIO
 import sys
-from base64 import b64encode
-import json
 import plotly.graph_objects as go
 import plotly.express as px
-import plotly.io as pio
 import pickle
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -39,11 +37,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-# Hardcoded API keys (use environment variables in production)
-os.environ["GROQ_API_KEY"] = "your_groq_api_key"
-os.environ["LANGSMITH_API_KEY"] = "your_langsmith_api_key"
-os.environ["LANGSMITH_TRACING"] = "true"
-os.environ["LANGSMITH_PROJECT"] = "DataAnalyticsPipeline"
+
 
 from langchain.chat_models import init_chat_model
 llm = init_chat_model("groq:llama3-8b-8192")
@@ -62,6 +56,7 @@ class State(TypedDict):
 persistent_vars = {}
 analysis_cache = {}
 analysis_history = []
+request_cache = set()  # To prevent duplicate requests
 
 def safe_get_message_content(msg):
     if hasattr(msg, 'content'):
@@ -107,10 +102,11 @@ def make_tool_graph():
         Returns:
             Tuple[str, dict]: Execution output and updated state
         """
+        # Normalize csv_path
+        csv_path = os.path.normpath(csv_path)
         logger.debug(f"Processing CSV at path: {csv_path}")
         current_variables = persistent_vars.copy()
 
-        # Validate CSV path
         if not os.path.exists(csv_path):
             error_msg = f"Error: CSV not found at {csv_path}"
             logger.error(error_msg)
@@ -119,20 +115,16 @@ def make_tool_graph():
             }
 
         try:
-            # Load CSV data
             if 'df' not in current_variables:
                 current_variables["df"] = pd.read_csv(csv_path)
                 logger.debug(f"Loaded CSV with shape: {current_variables['df'].shape}")
 
-            # Setup output directories
             os.makedirs("static/outputs/plotly_figures/pickle", exist_ok=True)
             os.makedirs("static/outputs/images", exist_ok=True)
             
-            # Capture stdout
             old_stdout = sys.stdout
             sys.stdout = StringIO()
 
-            # Setup execution environment
             exec_globals = globals().copy()
             exec_globals.update(current_variables)
             exec_globals.update({
@@ -157,51 +149,45 @@ def make_tool_graph():
                 "model_metrics": {}
             })
 
-            # Execute the code
             exec(python_code, exec_globals)
 
-            # Get output
             output = sys.stdout.getvalue()
             sys.stdout = old_stdout
 
-            # Update persistent variables
             persistent_vars.update({k: v for k, v in exec_globals.items() 
                                   if k not in globals() and not k.startswith('__')})
 
-            # Handle plotly figures
             output_image_paths = []
             if exec_globals.get("plotly_figures"):
-                for i, fig in enumerate(exec_globals["plotly_figures"]):
-                    pickle_filename = f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle"
-                    html_filename = f"static/outputs/images/{uuid.uuid4()}.html"
+                for fig in exec_globals["plotly_figures"]:
+                    pickle_filename = os.path.normpath(f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle")
+                    html_filename = os.path.normpath(f"static/outputs/images/{uuid.uuid4()}.html")
                     with open(pickle_filename, 'wb') as f:
                         pickle.dump(fig, f)
                     fig.write_html(html_filename)
                     output_image_paths.append({
                         "path": pickle_filename,
                         "type": "pickle",
-                        "url": f"/serve_file/{pickle_filename.replace('static/', '')}"
+                        "url": f"/serve_file/{pickle_filename.replace('static/', '').replace(os.sep, '/')}"
                     })
                     output_image_paths.append({
                         "path": html_filename,
                         "type": "html",
-                        "url": f"/serve_file/{html_filename.replace('static/', '')}"
+                        "url": f"/serve_file/{html_filename.replace('static/', '').replace(os.sep, '/')}"
                     })
 
-            # Handle matplotlib figures
             if plt.get_fignums():
                 for fig_num in plt.get_fignums():
                     fig = plt.figure(fig_num)
-                    img_filename = f"static/outputs/images/{uuid.uuid4()}.png"
+                    img_filename = os.path.normpath(f"static/outputs/images/{uuid.uuid4()}.png")
                     fig.savefig(img_filename, dpi=300, bbox_inches='tight')
                     output_image_paths.append({
                         "path": img_filename,
                         "type": "png",
-                        "url": f"/serve_file/{img_filename.replace('static/', '')}"
+                        "url": f"/serve_file/{img_filename.replace('static/', '').replace(os.sep, '/')}"
                     })
                 plt.close('all')
 
-            # Prepare response
             updated_state = {
                 "intermediate_outputs": [{
                     "thought": thought,
@@ -217,7 +203,6 @@ def make_tool_graph():
                 "output_image_paths": output_image_paths
             }
 
-            # Update analysis history
             analysis_history.append({
                 "task_type": task_type,
                 "thought": thought,
@@ -225,41 +210,47 @@ def make_tool_graph():
                 "output_paths": [path["path"] for path in output_image_paths]
             })
 
-            logger.debug(f"Data processing successful. Output paths: {[p['path'] for p in output_image_paths]}")
-            return output or "Operation completed successfully", updated_state
+            logger.debug(f"Data processing successful. paths: {[p['path'] for p in output_image_paths]}")
+            return output or "Success", updated_state
 
         except Exception as e:
             sys.stdout = old_stdout
             error_msg = f"Error: {str(e)}"
             logger.error(error_msg)
             return error_msg, {
-                "intermediate_outputs": [{
-                    "thought": thought,
-                    "code": python_code,
-                    "output": error_msg,
-                    "task_type": task_type,
-                    "timestamp": datetime.now().isoformat()
-                }]
+                "intermediate_outputs": [
+                    {
+                        "thought": thought,
+                        "code": python_code,
+                        "output": error_msg,
+                        "task_type": task_type,
+                        "timestamp": datetime.now().isoformat(),
+                    }
+                ]
             }
 
     @tool
     def automated_eda_tool(
         csv_path: str,
-        analysis_depth: str = "comprehensive"
+        analysis_level: str = "comprehensive"
     ) -> Tuple[str, dict]:
         """
-        Automated Exploratory Data Analysis tool with enhanced visualization capabilities.
+        Automated Exploratory Data Analysis tool.
         
         Args:
             csv_path (str): Path to input CSV file
-            analysis_depth (str): Level of analysis (quick, standard, comprehensive)
+            analysis_level (str): Level of analysis (quick, standard, comprehensive)
         
         Returns:
             Tuple[str, dict]: EDA results and updated state
         """
+        # Normalize csv_path
+        csv_path = os.path.normpath(csv_path)
         try:
             if not os.path.exists(csv_path):
-                return f"Error: CSV not found at {csv_path}", {}
+                error_msg = f"Error: CSV not found at {csv_path}"
+                logger.error(error_msg)
+                return error_msg, {}
                 
             df = pd.read_csv(csv_path)
             logger.debug(f"Starting automated EDA for dataset with shape: {df.shape}")
@@ -268,7 +259,7 @@ def make_tool_graph():
                 "dataset_info": {
                     "shape": df.shape,
                     "columns": list(df.columns),
-                    "dtypes": df.dtypes.to_dict(),
+                    "dtypes": {col: str(dtype) for col, dtype in df.dtypes.items()},
                     "memory_usage": df.memory_usage(deep=True).sum(),
                     "missing_values": df.isnull().sum().to_dict(),
                     "duplicate_rows": df.duplicated().sum(),
@@ -285,25 +276,20 @@ def make_tool_graph():
             output_image_paths = []
             plotly_figures = []
 
-            # Correlation analysis
             numeric_cols = df.select_dtypes(include=[np.number]).columns
             if len(numeric_cols) > 1:
                 corr_matrix = df[numeric_cols].corr()
                 eda_results["correlations"] = corr_matrix.to_dict()
-                
-                # Create correlation heatmap
                 fig = px.imshow(corr_matrix, text_auto=True, aspect="auto",
                               title="Correlation Heatmap", color_continuous_scale='RdBu_r')
                 plotly_figures.append(fig)
 
-            # Generate insights
             insights = []
             missing_pct = (df.isnull().sum() / len(df) * 100)
             high_missing = missing_pct[missing_pct > 20]
             if not high_missing.empty:
                 insights.append(f"High missing data (>20%) in columns: {list(high_missing.index)}")
             
-            # Skewness and outlier analysis
             for col in numeric_cols:
                 skewness = df[col].skew()
                 eda_results["skewness"][col] = skewness
@@ -320,48 +306,42 @@ def make_tool_graph():
             
             eda_results["insights"] = insights
             
-            # Comprehensive visualizations
-            if analysis_depth in ["standard", "comprehensive"]:
-                # Distribution plots
-                for col in numeric_cols[:4]:  # Limit to 4 columns
+            if analysis_level in ["standard", "comprehensive"]:
+                for col in numeric_cols[:4]:
                     fig = px.histogram(df, x=col, title=f'Distribution of {col}',
                                      nbins=50, marginal="box")
                     plotly_figures.append(fig)
                 
-                # Categorical variable analysis
                 categorical_cols = df.select_dtypes(include=['object']).columns
-                for col in categorical_cols[:3]:  # Limit to 3 columns
+                for col in categorical_cols[:3]:
                     value_counts = df[col].value_counts().head(10)
                     fig = px.bar(x=value_counts.index, y=value_counts.values,
                                title=f'Top 10 Values in {col}',
                                labels={'x': col, 'y': 'Count'})
                     plotly_figures.append(fig)
                 
-                # Pair plots for top numeric columns
-                if len(numeric_cols) >= 2 and analysis_depth == "comprehensive":
+                if len(numeric_cols) >= 2 and analysis_level == "comprehensive":
                     fig = px.scatter_matrix(df[numeric_cols[:4]],
                                           title="Pair Plot of Numeric Variables",
                                           dimensions=numeric_cols[:4])
                     plotly_figures.append(fig)
 
-            # Save visualizations
             for fig in plotly_figures:
-                pickle_filename = f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle"
-                html_filename = f"static/outputs/images/{uuid.uuid4()}.html"
+                pickle_filename = os.path.normpath(f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle")
+                html_filename = os.path.normpath(f"static/outputs/images/{uuid.uuid4()}.html")
                 with open(pickle_filename, 'wb') as f:
                     pickle.dump(fig, f)
                 fig.write_html(html_filename)
                 output_image_paths.extend([
                     {"path": pickle_filename, "type": "pickle", 
-                     "url": f"/serve_file/{pickle_filename.replace('static/', '')}"},
+                     "url": f"/serve_file/{pickle_filename.replace('static/', '').replace(os.sep, '/')}"},
                     {"path": html_filename, "type": "html", 
-                     "url": f"/serve_file/{html_filename.replace('static/', '')}"}
+                     "url": f"/serve_file/{html_filename.replace('static/', '').replace(os.sep, '/')}"}
                 ])
 
-            # Update analysis history
             analysis_history.append({
                 "task_type": "eda",
-                "thought": "Automated EDA with comprehensive analysis and visualizations",
+                "thought": f"Automated EDA with {analysis_level} analysis",
                 "timestamp": datetime.now().isoformat(),
                 "output_paths": [path["path"] for path in output_image_paths]
             })
@@ -385,20 +365,24 @@ def make_tool_graph():
         max_visualizations: int = 5
     ) -> Tuple[str, dict]:
         """
-        Smart visualization tool with automated chart selection and customization.
+        Smart visualization tool with automated chart selection.
         
         Args:
             csv_path (str): Path to input CSV file
             viz_type (str): Type of visualization (auto, scatter, bar, line, heatmap)
             columns (List[str]): Specific columns to visualize
-            max_visualizations (int): Maximum number of visualizations to generate
+            max_visualizations (int): Maximum number of visualizations
         
         Returns:
             Tuple[str, dict]: Visualization results and updated state
         """
+        # Normalize csv_path
+        csv_path = os.path.normpath(csv_path)
         try:
             if not os.path.exists(csv_path):
-                return f"Error: CSV not found at {csv_path}", {}
+                error_msg = f"Error: CSV not found at {csv_path}"
+                logger.error(error_msg)
+                return error_msg, {}
                 
             df = pd.read_csv(csv_path)
             numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
@@ -408,29 +392,24 @@ def make_tool_graph():
             output_image_paths = []
             
             if viz_type == "auto":
-                # Auto-suggest visualizations
-                # 1. Distribution plots
                 for col in numeric_cols[:min(3, len(numeric_cols))]:
                     fig = px.histogram(df, x=col, title=f'Distribution of {col}',
                                      nbins=50, marginal="box",
                                      color_discrete_sequence=['#636EFA'])
                     plotly_figures.append(fig)
                 
-                # 2. Correlation heatmap
                 if len(numeric_cols) > 1:
                     corr_matrix = df[numeric_cols].corr()
                     fig = px.imshow(corr_matrix, text_auto=True, aspect="auto",
                                   title="Correlation Heatmap", color_continuous_scale='RdBu_r')
                     plotly_figures.append(fig)
                 
-                # 3. Scatter plots for numeric pairs
                 if len(numeric_cols) >= 2:
                     fig = px.scatter(df, x=numeric_cols[0], y=numeric_cols[1],
                                    title=f'{numeric_cols[0]} vs {numeric_cols[1]}',
                                    trendline="ols", color_discrete_sequence=['#EF553B'])
                     plotly_figures.append(fig)
                 
-                # 4. Bar charts for categorical columns
                 if len(categorical_cols) > 0:
                     for col in categorical_cols[:min(2, len(categorical_cols))]:
                         value_counts = df[col].value_counts().head(10)
@@ -441,16 +420,15 @@ def make_tool_graph():
                         plotly_figures.append(fig)
             
             else:
-                # Specific visualization types
                 if viz_type == "scatter" and len(numeric_cols) >= 2:
-                    x_col = columns[0] if columns else numeric_cols[0]
+                    x_col = columns[0] if columns and len(columns) > 0 else numeric_cols[0]
                     y_col = columns[1] if columns and len(columns) > 1 else numeric_cols[1]
                     fig = px.scatter(df, x=x_col, y=y_col, title=f'{x_col} vs {y_col}',
                                    trendline="ols", color_discrete_sequence=['#EF553B'])
                     plotly_figures.append(fig)
                 
                 elif viz_type == "bar" and len(categorical_cols) > 0:
-                    col = columns[0] if columns else categorical_cols[0]
+                    col = columns[0] if columns and len(columns) > 0 else categorical_cols[0]
                     value_counts = df[col].value_counts().head(15)
                     fig = px.bar(x=value_counts.index, y=value_counts.values,
                                title=f'Distribution of {col}',
@@ -459,7 +437,7 @@ def make_tool_graph():
                     plotly_figures.append(fig)
                 
                 elif viz_type == "line" and len(numeric_cols) > 0:
-                    col = columns[0] if columns else numeric_cols[0]
+                    col = columns[0] if columns and len(columns) > 0 else numeric_cols[0]
                     fig = px.line(df.reset_index(), x='index', y=col,
                                 title=f'Trend of {col}',
                                 color_discrete_sequence=['#636EFA'])
@@ -471,26 +449,23 @@ def make_tool_graph():
                                   title="Correlation Heatmap", color_continuous_scale='RdBu_r')
                     plotly_figures.append(fig)
 
-            # Limit number of visualizations
             plotly_figures = plotly_figures[:max_visualizations]
             
-            # Save visualizations
             for fig in plotly_figures:
-                pickle_filename = f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle"
-                html_filename = f"static/outputs/images/{uuid.uuid4()}.html"
+                pickle_filename = os.path.normpath(f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle")
+                html_filename = os.path.normpath(f"static/outputs/images/{uuid.uuid4()}.html")
                 
                 with open(pickle_filename, 'wb') as f:
-                    pickle.dumpp(fig, f)
+                    pickle.dump(fig, f)
                 fig.write_html(html_filename)
                 
                 output_image_paths.extend([
                     {"path": pickle_filename, "type": "pickle", 
-                     "url": f"/serve_file/{pickle_filename.replace('static/', '')}"},
+                     "url": f"/serve_file/{pickle_filename.replace('static/', '').replace(os.sep, '/')}"},
                     {"path": html_filename, "type": "html", 
-                     "url": f"/serve_file/{html_filename.replace('static/', '')}"}
+                     "url": f"/serve_file/{html_filename.replace('static/', '').replace(os.sep, '/')}"}
                 ])
 
-            # Update analysis history
             analysis_history.append({
                 "task_type": "visualization",
                 "thought": f"Generated {len(plotly_figures)} {viz_type} visualizations",
@@ -513,46 +488,44 @@ def make_tool_graph():
         csv_path: str,
         target_column: str,
         model_type: str = "auto",
-        test_size: float = 0.2,
-        hyperparameter_tuning: bool = False
+        test_size: float = 0.2
     ) -> Tuple[str, dict]:
         """
-        Enhanced machine learning modeling tool with automated feature engineering and optional hyperparameter tuning.
+        Machine learning modeling tool with automated model selection.
         
         Args:
             csv_path (str): Path to input CSV file
             target_column (str): Target column for prediction
             model_type (str): Type of ML model (auto, classification, regression)
             test_size (float): Proportion of data for testing
-            hyperparameter_tuning (bool): Whether to perform hyperparameter tuning
         
         Returns:
             Tuple[str, dict]: Model results and updated state
         """
+        # Normalize csv_path
+        csv_path = os.path.normpath(csv_path)
         try:
             if not os.path.exists(csv_path):
-                return f"Error: CSV not found at {csv_path}", {}
+                error_msg = f"Error: CSV not found at {csv_path}"
+                logger.error(error_msg)
+                return error_msg, {}
                 
             df = pd.read_csv(csv_path)
             
             if target_column not in df.columns:
                 return f"Error: Target column '{target_column}' not found in dataset", {}
             
-            # Prepare data
             X = df.drop(columns=[target_column])
             y = df[target_column]
             
-            # Automated feature engineering
             le_dict = {}
             for col in X.select_dtypes(include=['object']).columns:
                 le = LabelEncoder()
                 X[col] = le.fit_transform(X[col].astype(str))
                 le_dict[col] = le
             
-            # Handle missing values
             X = X.fillna(X.mean() if X.select_dtypes(include=[np.number]).shape[1] > 0 else 0)
             
-            # Determine problem type
             if model_type == "auto":
                 if y.dtype == 'object' or y.nunique() < 20:
                     problem_type = "classification"
@@ -561,12 +534,10 @@ def make_tool_graph():
             else:
                 problem_type = model_type
             
-            # Split data
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=test_size, random_state=42
             )
             
-            # Scale features
             scaler = StandardScaler()
             X_train_scaled = scaler.fit_transform(X_train)
             X_test_scaled = scaler.transform(X_test)
@@ -600,7 +571,6 @@ def make_tool_graph():
                     "feature_importance": dict(zip(X.columns, model.feature_importances_))
                 }
             
-            # Feature importance visualization
             importance_df = pd.DataFrame({
                 'feature': X.columns,
                 'importance': model.feature_importances_
@@ -610,9 +580,8 @@ def make_tool_graph():
                         orientation='h', title='Top 10 Feature Importance',
                         color_discrete_sequence=['#EF553B'])
             
-            # Save visualization
-            pickle_filename = f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle"
-            html_filename = f"static/outputs/images/{uuid.uuid4()}.html"
+            pickle_filename = os.path.normpath(f"static/outputs/plotly_figures/pickle/{uuid.uuid4()}.pickle")
+            html_filename = os.path.normpath(f"static/outputs/images/{uuid.uuid4()}.html")
             
             with open(pickle_filename, 'wb') as f:
                 pickle.dump(fig, f)
@@ -620,12 +589,11 @@ def make_tool_graph():
             
             output_image_paths = [
                 {"path": pickle_filename, "type": "pickle", 
-                 "url": f"/serve_file/{pickle_filename.replace('static/', '')}"},
+                 "url": f"/serve_file/{pickle_filename.replace('static/', '').replace(os.sep, '/')}"},
                 {"path": html_filename, "type": "html", 
-                 "url": f"/serve_file/{html_filename.replace('static/', '')}"}
+                 "url": f"/serve_file/{html_filename.replace('static/', '').replace(os.sep, '/')}"}
             ]
 
-            # Update analysis history
             analysis_history.append({
                 "task_type": "modeling",
                 "thought": f"Trained {problem_type} model on {target_column}",
@@ -661,9 +629,13 @@ def make_tool_graph():
         Returns:
             Tuple[str, dict]: Pipeline results and updated state
         """
+        # Normalize csv_path
+        csv_path = os.path.normpath(csv_path)
         try:
             if not os.path.exists(csv_path):
-                return f"Error: CSV not found at {csv_path}", {}
+                error_msg = f"Error: CSV not found at {csv_path}"
+                logger.error(error_msg)
+                return error_msg, {}
                 
             combined_results = {
                 "eda_results": {},
@@ -672,25 +644,21 @@ def make_tool_graph():
                 "output_image_paths": []
             }
 
-            # 1. Run EDA
-            eda_output, eda_state = automated_eda_tool(csv_path, analysis_depth=analysis_level)
+            eda_output, eda_state = automated_eda_tool(csv_path, analysis_level=analysis_level)
             combined_results["eda_results"] = eda_state.get("analysis_results", {})
             combined_results["output_image_paths"].extend(eda_state.get("output_image_paths", []))
             
-            # 2. Generate Visualizations
             viz_output, viz_state = smart_visualization_tool(csv_path, viz_type="auto",
                                                           max_visualizations=5 if analysis_level == "comprehensive" else 3)
             combined_results["visualization_results"] = viz_state
             combined_results["output_image_paths"].extend(viz_state.get("output_image_paths", []))
             
-            # 3. Run ML modeling if target column is provided
             if target_column:
                 model_output, model_state = ml_modeling_tool(csv_path, target_column,
                                                           model_type="auto", test_size=0.2)
                 combined_results["modeling_results"] = model_state.get("analysis_results", {})
                 combined_results["output_image_paths"].extend(model_state.get("output_image_paths", []))
 
-            # Update analysis history
             analysis_history.append({
                 "task_type": "automated_pipeline",
                 "thought": f"Completed automated pipeline with {'EDA, visualization, and modeling' if target_column else 'EDA and visualization'}",
@@ -718,58 +686,67 @@ def make_tool_graph():
         You have access to tools for:
         1. complete_python_task: Execute custom pandas/plotly/sklearn code
         2. automated_eda_tool: Perform comprehensive exploratory data analysis
-        3. smart_visualization_tool: Create intelligent visualizations
+        3. smart_visualization_tool: Generate intelligent visualizations
         4. ml_modeling_tool: Build and evaluate ML models
         5. automated_pipeline: Run complete analysis pipeline (EDA + visualization + optional modeling)
 
-        For generic requests like "analyze my data", use automated_pipeline.
-        For specific requests:
-        - EDA: Use automated_eda_tool
+        For analysis requests:
+        - Generic: Use automated_pipeline
+        - Specific EDA: Use automated_eda_tool
         - Visualization: Use smart_visualization_tool
         - Modeling: Use ml_modeling_tool
-        - Custom analysis: Use complete_python_task
+        - Custom: Use complete_python_task
 
         Always:
-        1. Use csv_path from state['csv_path']
-        2. Explain approach in 'thought' parameter
-        3. Append visualizations to output_image_paths
-        4. Store results in analysis_results
-        5. Handle missing data and categorical variables
-        6. Provide actionable insights
-        7. Cache results for efficiency
-        8. Maintain analysis history
+        1. Use csv_path from state['csv_path'] with forward slashes (/)
+        2. Validate csv_path exists before tool calls
+        3. Explain approach in 'thought' parameter
+        4. Append visualizations to output_image_paths
+        5. Store results in analysis_results
+        6. Handle missing data and categorical variables
+        7. Provide actionable insights
+        8. Cache results for efficiency
+        9. Maintain analysis history
         """
         try:
             messages = state["messages"]
+            csv_path = os.path.normpath(state.get("csv_path", "")).replace(os.sep, '/')
+            
+            if not csv_path or not os.path.exists(csv_path):
+                error_msg = f"Invalid or missing CSV path: {csv_path}"
+                logger.error(error_msg)
+                return {
+                    "messages": [AIMessage(content=error_msg)],
+                    "csv_path": csv_path,
+                    "analysis_history": analysis_history
+                }
+
             if not any(safe_get_message_role(msg) == 'system' for msg in messages):
                 messages = [SystemMessage(content=system_prompt)] + messages
                 
-            if state.get("csv_path"):
-                for msg in messages:
-                    if isinstance(msg, HumanMessage) and "csv_path" not in msg.content:
-                        msg.content += f"\nCSV path: {state['csv_path']}"
+            for msg in messages:
+                if isinstance(msg, HumanMessage) and "csv_path" not in msg.content:
+                    msg.content += f"\nCSV path: {csv_path}"
             
-            # Check cache
-            cache_key = f"{state['csv_path']}:{safe_get_message_content(messages[-1])}"
+            cache_key = f"{csv_path}:{safe_get_message_content(messages[-1])}"
             if cache_key in analysis_cache:
                 logger.debug("Returning cached result")
                 return analysis_cache[cache_key]
             
             response = llm_with_tools.invoke(messages)
             
-            # Cache result
             analysis_cache[cache_key] = {
                 "messages": [response],
-                "csv_path": state.get("csv_path", ""),
+                "csv_path": csv_path,
                 "analysis_history": analysis_history
             }
             
-            return {"messages": [response], "csv_path": state.get("csv_path", ""),
+            return {"messages": [response], "csv_path": csv_path,
                     "analysis_history": analysis_history}
         except Exception as e:
-            logger.error(f"LLM call error: {e}")
+            logger.error(f"LLM call error: {str(e)}")
             return {
-                "messages": [AIMessage(content=f"I encountered an error: {str(e)}. Please try again.")],
+                "messages": [AIMessage(content=f"I encountered an error: {str(e)}. Please check the CSV path or try again.")],
                 "csv_path": state.get("csv_path", ""),
                 "analysis_history": analysis_history
             }
@@ -797,48 +774,38 @@ def upload_csv():
     if not file.filename.lower().endswith('.csv'):
         return jsonify({"error": "Only CSV files are supported"}), 400
     
-    upload_dir = "static/uploads"
+    upload_dir = r"static/uploads"
     os.makedirs(upload_dir, exist_ok=True)
     
-    filename = os.path.join(upload_dir, f"{uuid.uuid4()}.csv")
+    filename = os.path.normpath(os.path.join(upload_dir, f"{uuid.uuid4()}.csv")).replace(os.sep, '/')
     
     try:
         file.save(filename)
         df = pd.read_csv(filename)
         logger.debug(f"CSV saved to {filename} with shape: {df.shape}")
         
-        # Run automated pipeline immediately after upload
-        pipeline_output, pipeline_state = tool_agent.invoke({
-            "messages": [HumanMessage(content="Run automated analysis pipeline")],
-            "input_data": [{"variable_name": "df", "data_type": "csv", "data_path": filename}],
-            "current_variables": {},
-            "intermediate_outputs": [],
-            "output_image_paths": [],
-            "analysis_results": {},
-            "csv_path": filename,
-            "analysis_history": []
-        }).get("tools", ({}, {}))[1]
+        # Convert dtypes to string to ensure JSON serializability
+        dtypes_dict = {col: str(dtype) for col, dtype in df.dtypes.items()}
         
         return jsonify({
             "csv_path": filename,
-            "message": "CSV uploaded and analyzed successfully",
+            "message": "CSV uploaded successfully",
             "info": {
                 "shape": df.shape,
                 "columns": list(df.columns),
-                "dtypes": df.dtypes.to_dict()
-            },
-            "pipeline_results": pipeline_state
+                "dtypes": dtypes_dict
+            }
         })
     except Exception as e:
-        logger.error(f"Failed to save or analyze CSV: {str(e)}")
-        return jsonify({"error": f"Failed to process CSV: {str(e)}"}), 500
+        logger.error(f"Failed to save CSV: {str(e)}")
+        return jsonify({"error": f"Failed to save CSV: {str(e)}"}), 500
 
 @app.route('/chat', methods=['POST'])
 def chat():
     try:
         data = request.get_json()
         user_message = data.get('message', '')
-        csv_path = data.get('csv_path', '')
+        csv_path = os.path.normpath(data.get('csv_path', '')).replace(os.sep, '/')
         
         if not user_message:
             return jsonify({"error": "Message is required"}), 400
@@ -847,6 +814,13 @@ def chat():
             error_msg = f"CSV file not found at {csv_path}"
             logger.error(error_msg)
             return jsonify({"error": error_msg}), 400
+
+        # Generate a request hash to prevent duplicate processing
+        request_hash = hashlib.sha256(f"{user_message}:{csv_path}".encode()).hexdigest()
+        if request_hash in request_cache:
+            logger.debug(f"Duplicate request detected: {request_hash}")
+            return jsonify({"message": "Request already processed, please try a new query"}), 200
+        request_cache.add(request_hash)
 
         logger.debug(f"Processing chat request with csv_path: {csv_path}, message: {user_message}")
         
@@ -867,6 +841,9 @@ def chat():
         
         result = tool_agent.invoke(initial_state)
         
+        # Clear request cache after successful processing
+        request_cache.discard(request_hash)
+
         response_data = {
             "message": "Analysis completed",
             "intermediate_outputs": result.get("intermediate_outputs", []),
@@ -896,26 +873,27 @@ def chat():
         return jsonify(response_data)
     except Exception as e:
         logger.error(f"Chat endpoint error: {str(e)}")
+        request_cache.discard(request_hash)
         return jsonify({"error": f"Failed to process request: {str(e)}"}), 500
 
 @app.route('/serve_file/<path:filename>')
 def serve_file(filename):
     try:
-        file_path = os.path.join('static', filename)
+        file_path = os.path.normpath(os.path.join('static', filename)).replace(os.sep, '/')
         if not os.path.exists(file_path):
-            return jsonify({"error": "File not found"}), 404
+            return jsonify({"error": "File not found"}), 400
             
-        if filename.endswith('.png'):
+        if filename.lower().endswith('.png'):
             return send_file(file_path, mimetype='image/png')
-        elif filename.endswith('.html'):
+        elif filename.lower().endswith('.html'):
             return send_file(file_path, mimetype='text/html')
-        elif filename.endswith('.pickle'):
+        elif filename.lower().endswith('.pickle'):
             return send_file(file_path, mimetype='application/octet-stream')
         else:
             return jsonify({"error": "Unsupported file type"}), 400
     except Exception as e:
-        logger.error(f"Error serving file {filename}: {str(e)}")
+        logger.error(f"Error: {str(e)}")
         return jsonify({"error": f"Failed to serve file: {str(e)}"}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)

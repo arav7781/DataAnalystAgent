@@ -1,7 +1,7 @@
 "use client";
 import type React from "react";
 import { useState, useRef, useEffect } from "react";
-import { Upload, Send, Zap, Brain, ImageIcon, Sparkles, Download, BarChart, FileText } from "lucide-react";
+import { Upload, Send, Zap, Brain, FileText, Sparkles, Download, BarChart } from "lucide-react";
 
 interface Message {
   role: string;
@@ -29,17 +29,16 @@ const DataAnalyticsAI: React.FC = () => {
   const [loading, setLoading] = useState<boolean>(false);
   const [analysisResults, setAnalysisResults] = useState<any>(null);
   const [isUploading, setIsUploading] = useState<boolean>(false);
+  const [datasetInfo, setDatasetInfo] = useState<any>(null);
   const chatContainerRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Scroll to bottom of chat container when messages update
   useEffect(() => {
     if (chatContainerRef.current) {
       chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
     }
   }, [messages]);
 
-  // Handle CSV file upload
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     if (event.target.files && event.target.files[0] && !isUploading) {
       const file = event.target.files[0];
@@ -54,6 +53,7 @@ const DataAnalyticsAI: React.FC = () => {
       setAnalysisResults(null);
       setMessages([]);
       setCsvPath(null);
+      setDatasetInfo(null);
 
       const formData = new FormData();
       formData.append("file", file);
@@ -65,22 +65,22 @@ const DataAnalyticsAI: React.FC = () => {
           body: formData,
         });
 
-        const data = await response.json();
         if (!response.ok) {
-          throw new Error(data.error || "Upload failed");
+          const errorData = await response.json();
+          throw new Error(errorData.error || `Upload failed: ${response.statusText}`);
         }
 
+        const data = await response.json();
         setCsvPath(data.csv_path);
+        setDatasetInfo(data.info);
         setMessages([
           {
             role: "system",
-            content: `CSV uploaded successfully to ${data.csv_path}. Initial analysis completed. Ask for specific analysis or visualizations.`,
-            images: data.pipeline_results.output_image_paths || [],
+            content: `CSV uploaded successfully to ${data.csv_path}. Please provide analysis instructions (e.g., 'Run comprehensive EDA', 'Create scatter plots', or 'Build predictive model').`,
           },
         ]);
-        setAnalysisResults(data.pipeline_results);
       } catch (err: any) {
-        setError(err.message || "Failed to upload CSV");
+        setError(err.message || "Failed to upload CSV. Is the server running?");
         console.error("Upload error:", err);
         if (fileInputRef.current) {
           fileInputRef.current.value = "";
@@ -93,10 +93,12 @@ const DataAnalyticsAI: React.FC = () => {
     }
   };
 
-  // Handle download of visualizations
   const handleDownloadFile = async (url: string, filename: string) => {
     try {
       const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Download failed: ${response.statusText}`);
+      }
       const blob = await response.blob();
       const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement("a");
@@ -112,7 +114,6 @@ const DataAnalyticsAI: React.FC = () => {
     }
   };
 
-  // Handle sending chat messages
   const handleSendMessage = async () => {
     if (!input.trim()) {
       setError("Please enter a message");
@@ -142,11 +143,12 @@ const DataAnalyticsAI: React.FC = () => {
         }),
       });
 
-      const data: AnalysisResponse = await response.json();
       if (!response.ok) {
-        throw new Error(data.message || "Analysis failed");
+        const errorData = await response.json();
+        throw new Error(errorData.error || `Analysis failed: ${response.statusText}`);
       }
 
+      const data: AnalysisResponse = await response.json();
       const updatedMessages = [...messages, userMessage];
 
       if (data.messages && Array.isArray(data.messages)) {
@@ -189,7 +191,7 @@ const DataAnalyticsAI: React.FC = () => {
       }
     } catch (err: any) {
       console.error("Chat error:", err);
-      setError(err.message || "An error occurred during analysis");
+      setError(err.message || "An error occurred during analysis. Is the server running?");
       setMessages((prev) => [
         ...prev,
         {
@@ -202,7 +204,6 @@ const DataAnalyticsAI: React.FC = () => {
     }
   };
 
-  // Render message content with support for markdown and code blocks
   const renderMessageContent = (message: Message) => {
     const { content } = message;
 
@@ -239,14 +240,12 @@ const DataAnalyticsAI: React.FC = () => {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-green-50 via-emerald-50 to-green-100 text-gray-800 relative overflow-hidden">
-      {/* Background Elements */}
       <div className="absolute inset-0 overflow-hidden">
         <div className="absolute -top-40 -right-40 w-80 h-80 bg-gradient-to-br from-green-200 to-emerald-200 rounded-full mix-blend-multiply filter blur-xl opacity-20 animate-pulse"></div>
         <div className="absolute -bottom-40 -left-40 w-80 h-80 bg-gradient-to-br from-emerald-200 to-green-200 rounded-full mix-blend-multiply filter blur-xl opacity-20 animate-pulse delay-1000"></div>
       </div>
 
       <div className="relative z-10 flex flex-col items-center p-6">
-        {/* Header */}
         <div className="text-center mb-8 opacity-0 animate-fade-in">
           <div className="flex items-center justify-center gap-4 mb-6">
             <div className="p-4 bg-gradient-to-br from-green-500 to-emerald-600 rounded-2xl shadow-lg">
@@ -263,7 +262,6 @@ const DataAnalyticsAI: React.FC = () => {
           <div className="w-24 h-1 bg-gradient-to-r from-green-500 to-emerald-500 mx-auto mt-4 rounded-full"></div>
         </div>
 
-        {/* CSV Upload Section */}
         <div className="w-full max-w-6xl mb-8">
           <div className="bg-white/80 backdrop-blur-sm border border-green-200 rounded-2xl p-8 shadow-lg hover:shadow-xl transition-all duration-300">
             <div className="flex items-center gap-3 mb-6">
@@ -292,8 +290,7 @@ const DataAnalyticsAI: React.FC = () => {
             </div>
           </div>
 
-          {/* Dataset Info */}
-          {selectedFile && csvPath && (
+          {selectedFile && csvPath && datasetInfo && (
             <div className="bg-white/80 backdrop-blur-sm border border-green-200 rounded-2xl p-8 shadow-lg mt-6 opacity-0 animate-slide-up hover:shadow-xl transition-all duration-300">
               <div className="flex items-center gap-3 mb-6">
                 <div className="p-2 bg-green-100 rounded-lg">
@@ -304,17 +301,12 @@ const DataAnalyticsAI: React.FC = () => {
               <div className="text-gray-700">
                 <p><strong>File:</strong> {selectedFile.name}</p>
                 <p><strong>Path:</strong> {csvPath}</p>
-                {analysisResults?.info && (
-                  <>
-                    <p><strong>Shape:</strong> {analysisResults.info.shape[0]} rows, {analysisResults.info.shape[1]} columns</p>
-                    <p><strong>Columns:</strong> {analysisResults.info.columns.join(", ")}</p>
-                  </>
-                )}
+                <p><strong>Shape:</strong> {datasetInfo.shape[0]} rows, {datasetInfo.shape[1]} columns</p>
+                <p><strong>Columns:</strong> {datasetInfo.columns.join(", ")}</p>
               </div>
             </div>
           )}
 
-          {/* Analysis Results */}
           {analysisResults && Object.keys(analysisResults).length > 0 && (
             <div className="bg-white/80 backdrop-blur-sm border border-green-200 rounded-2xl p-8 shadow-lg mt-6 opacity-0 animate-slide-up hover:shadow-xl transition-all duration-300">
               <div className="flex items-center gap-3 mb-6">
@@ -330,7 +322,6 @@ const DataAnalyticsAI: React.FC = () => {
           )}
         </div>
 
-        {/* Chat Section */}
         <div className="w-full max-w-6xl bg-white/80 backdrop-blur-sm border border-green-200 rounded-2xl shadow-lg p-8 mb-6 hover:shadow-xl transition-all duration-300">
           <div className="flex items-center gap-3 mb-6">
             <div className="p-2 bg-green-100 rounded-lg">
@@ -387,6 +378,7 @@ const DataAnalyticsAI: React.FC = () => {
                               src={img.url}
                               className="w-full h-64 rounded-xl shadow-lg border border-green-200 group-hover:shadow-xl transition-all duration-300"
                               title={`Visualization ${imgIndex + 1}`}
+                              onError={() => setError("Failed to load visualization")}
                             />
                             <button
                               onClick={() => handleDownloadFile(img.url, `visualization-${imgIndex + 1}.html`)}
@@ -413,7 +405,6 @@ const DataAnalyticsAI: React.FC = () => {
             )}
           </div>
 
-          {/* Input Section */}
           <div className="flex gap-4">
             <div className="flex-1 relative">
               <input
@@ -422,7 +413,7 @@ const DataAnalyticsAI: React.FC = () => {
                 onChange={(e) => setInput(e.target.value)}
                 onKeyPress={(e) => e.key === "Enter" && !loading && handleSendMessage()}
                 className="w-full p-4 rounded-xl text-gray-700 border bg-white border-green-300 focus:outline-none focus:border-green-500 focus:ring-2 focus:ring-green-200 transition-all duration-300 placeholder-gray-400"
-                placeholder="Enter analysis instructions (e.g., 'create a scatter plot', 'run regression', 'show correlations')..."
+                placeholder="Enter analysis instructions (e.g., 'Run comprehensive EDA', 'Create scatter plots', 'Build predictive model')..."
                 disabled={loading}
               />
               <div className="absolute right-4 top-1/2 transform -translate-y-1/2">
@@ -444,7 +435,6 @@ const DataAnalyticsAI: React.FC = () => {
           </div>
         </div>
 
-        {/* Error Display */}
         {error && (
           <div className="w-full max-w-6xl bg-red-50 border border-red-200 text-red-700 px-6 py-4 rounded-xl mb-6 shadow-sm opacity-0 animate-shake">
             <div className="flex items-center gap-3">
@@ -454,7 +444,6 @@ const DataAnalyticsAI: React.FC = () => {
           </div>
         )}
 
-        {/* Quick Actions */}
         <div className="w-full max-w-6xl bg-white/80 backdrop-blur-sm border border-green-200 rounded-2xl p-8 shadow-lg hover:shadow-xl transition-all duration-300">
           <div className="flex items-center gap-3 mb-6">
             <div className="p-2 bg-green-100 rounded-lg">
